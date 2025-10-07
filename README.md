@@ -93,21 +93,100 @@ function ensurePlayer(id) {
   return playerData[id];
 }
 
+// ---------------- LEADERBOARD ----------------
+async function updateLeaderboardChannel(guild) {
+  const channelName = "leaderboard";
+  let lbChannel = guild.channels.cache.find(c => c.name === channelName && c.type === 0);
+  if (!lbChannel) {
+    lbChannel = await guild.channels.create({ name: channelName, type: 0 });
+  }
+
+  // Build leaderboard sorted by Elo/IHP
+  const players = Object.keys(playerData)
+    .map(id => {
+      const p = playerData[id];
+      const gp = p.wins + p.losses;
+      const wr = gp ? ((p.wins / gp) * 100).toFixed(1) : "0.0";
+      return {
+        id,
+        rank: p.rank,
+        division: p.division,
+        lp: p.lp,
+        elo: getIHP(p),
+        wins: p.wins,
+        losses: p.losses,
+        wr,
+        gp
+      };
+    })
+    .sort((a, b) => b.elo - a.elo); // highest Elo first
+
+  // Split into chunks of 25
+  const chunkSize = 25;
+  const embeds = [];
+  for (let i = 0; i < players.length; i += chunkSize) {
+    const chunk = players.slice(i, i + chunkSize);
+    const description = chunk
+      .map((p, idx) => {
+        const rankDiv = p.division ? `${p.rank} ${p.division}` : p.rank;
+        const line1 = `#${i + idx + 1} • ${rankDiv} ${p.lp} LP`;
+        const line2 = `<@${p.id}> | Elo: ${p.elo} | W: ${p.wins} | L: ${p.losses} | WR: ${p.wr}% | GP: ${p.gp}`;
+        return `${line1}\n${line2}`;
+      })
+      .join("\n\n");
+
+    const embed = new EmbedBuilder()
+      .setTitle(i === 0 ? "🏆 Leaderboard" : `Leaderboard (cont.)`)
+      .setDescription(description)
+      .setColor(0xffd700)
+      .setTimestamp();
+    embeds.push(embed);
+  }
+
+  // EDIT existing messages if they exist
+  if (leaderboardMessage && leaderboardMessage.length) {
+    for (let i = 0; i < embeds.length; i++) {
+      const embed = embeds[i];
+      if (leaderboardMessage[i]) {
+        // Edit existing message
+        await leaderboardMessage[i].edit({ embeds: [embed] }).catch(() => {});
+      } else {
+        // Add new message if needed
+        const msg = await lbChannel.send({ embeds: [embed] });
+        leaderboardMessage.push(msg);
+      }
+    }
+    // Delete any extra old messages
+    if (leaderboardMessage.length > embeds.length) {
+      for (let i = embeds.length; i < leaderboardMessage.length; i++) {
+        await leaderboardMessage[i].delete().catch(() => {});
+      }
+      leaderboardMessage = leaderboardMessage.slice(0, embeds.length);
+    }
+  } else {
+    // No previous messages → send new ones
+    leaderboardMessage = [];
+    for (const embed of embeds) {
+      const msg = await lbChannel.send({ embeds: [embed] });
+      leaderboardMessage.push(msg);
+    }
+  }
+}
+
 // ---------------- READY CHECK ----------------
 async function startReadyCheck(channel) {
   const participants = [...queue];
   const ready = new Set();
-  const TIMEOUT = 60000; // 60 seconds to confirm
+  const TIMEOUT = 60; // seconds
+  let remaining = TIMEOUT;
+
   const embed = new EmbedBuilder()
     .setTitle("⚔️ Ready Check")
     .setDescription(
-      "10 players have queued!\n\n" +
-        "Click **✅ Ready** if you're ready to play.\n" +
-        "Click **❌ Not Ready** if you can't.\n\n" +
-        `⏳ You have ${TIMEOUT / 1000} seconds.`
+      `10 players have queued!\n\nClick **✅ Ready** if you're ready.\nClick **❌ Not Ready** if you can't.\n\n⏳ Time remaining: ${remaining}s`
     )
     .setColor(0x00ffff)
-    .setFooter({ text: "Waiting for players..." });
+    .setFooter({ text: `Waiting for players... | 0/${participants.length} ready` });
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("ready").setLabel("✅ Ready").setStyle(ButtonStyle.Success),
@@ -120,36 +199,48 @@ async function startReadyCheck(channel) {
     components: [row],
   });
 
-  const collector = msg.createMessageComponentCollector({ time: TIMEOUT });
+  const collector = msg.createMessageComponentCollector({ time: TIMEOUT * 1000 });
+
+  // Start countdown interval
+  const countdown = setInterval(async () => {
+    remaining--;
+    if (remaining < 0) return clearInterval(countdown);
+    const updatedEmbed = EmbedBuilder.from(embed)
+      .setFooter({ text: `✅ Ready: ${ready.size}/${participants.length}` })
+      .setDescription(
+        `10 players have queued!\n\nClick **✅ Ready** if you're ready.\nClick **❌ Not Ready** if you can't.\n\n⏳ Time remaining: ${remaining}s`
+      );
+    await msg.edit({ embeds: [updatedEmbed] }).catch(() => {});
+  }, 1000);
 
   collector.on("collect", async (i) => {
     if (!participants.includes(i.user.id)) {
       return i.reply({ content: "You're not in this queue.", ephemeral: true });
     }
     if (i.customId === "notready") {
-      // ❌ Someone declined → instantly cancel and remove them from queue
       queue = queue.filter((id) => id !== i.user.id);
       saveData();
       await updateQueueMessage();
-      // Announce who declined to the channel
       await msg.channel.send(`❌ <@${i.user.id}> declined the ready check. Match canceled.`);
       collector.stop("declined");
       await i.reply({ content: "You declined and have been removed from the queue.", ephemeral: true });
       return;
     }
-    // ✅ Player readied up
+
     ready.add(i.user.id);
     await i.deferUpdate();
     const updatedEmbed = EmbedBuilder.from(embed).setFooter({
       text: `✅ Ready: ${ready.size}/${participants.length}`,
     });
     await msg.edit({ embeds: [updatedEmbed], components: [row] });
+
     if (ready.size === participants.length) {
       collector.stop("all_ready");
     }
   });
 
   collector.on("end", async (_, reason) => {
+    clearInterval(countdown); // stop countdown updates
     if (reason === "all_ready") {
       await msg.edit({
         embeds: [
@@ -169,17 +260,15 @@ async function startReadyCheck(channel) {
         ],
         components: [],
       });
-      await updateQueueMessage(); // keep queue intact
+      await updateQueueMessage();
     } else {
-      // ⌛ Ready check timed out — remove AFK players
       const notReady = participants.filter((id) => !ready.has(id));
-      // Remove all not-ready (AFK) players from the queue
       if (notReady.length > 0) {
         queue = queue.filter((id) => !notReady.includes(id));
         saveData();
         await updateQueueMessage();
         await msg.channel.send(
-          `⌛ Ready check timed out. The following players did not respond and were removed from the queue:\n${notReady
+          `⌛ Ready check timed out. The following players did not respond and were removed:\n${notReady
             .map((id) => `<@${id}>`)
             .join(", ")}`
         );
@@ -341,72 +430,6 @@ async function updateQueueMessage() {
 
   const embed = buildQueueEmbed();
   await queueMessage.edit({ embeds: [embed], components: [row] });
-}
-
-// ---------------- LEADERBOARD ----------------
-async function updateLeaderboardChannel(guild) {
-  let channel = guild.channels.cache.find((c) => c.name === "leaderboard");
-  if (!channel) {
-    channel = await guild.channels.create({ name: "leaderboard", type: 0 });
-  }
-
-  // Fetch or create initial leaderboard message
-  if (!leaderboardMessage) {
-    leaderboardMessage = await channel.send({ content: "Loading leaderboard..." });
-  }
-
-  setInterval(async () => {
-    const players = Object.entries(playerData).map(([id, p]) => {
-      const games = (p.wins || 0) + (p.losses || 0);
-      const wr = games > 0 ? ((p.wins / games) * 100).toFixed(1) : "0.0";
-      return { id, ...p, IHP: getIHP(p), games, wr };
-    });
-
-    players.sort((a, b) => b.IHP - a.IHP);
-
-    // Split into chunks of 25 (Discord embed limit)
-    const chunkSize = 25;
-    const chunks = [];
-    for (let i = 0; i < players.length; i += chunkSize) {
-      chunks.push(players.slice(i, i + chunkSize));
-    }
-
-    // Build embeds
-    const embeds = chunks.map((chunk, chunkIndex) => {
-      const embed = new EmbedBuilder()
-        .setTitle(chunkIndex === 0 ? "🏆 Leaderboard" : `🏆 Leaderboard (Page ${chunkIndex + 1})`)
-        .setColor(0x808080)
-        .setTimestamp();
-
-      chunk.forEach((p, i) => {
-        const rankText = p.division
-          ? `${p.rank} ${p.division} ${p.lp} LP`
-          : `${p.rank} ${p.lp} LP`;
-
-        embed.addFields({
-          name: `**${chunkIndex * chunkSize + i + 1}. <@${p.id}> - ${rankText}**`,
-          value: `Elo: ${p.IHP} | W: ${p.wins || 0} | L: ${p.losses || 0} | WR: ${p.wr}% | GP: ${p.games}`,
-        });
-      });
-
-      return embed;
-    });
-
-    // Edit message with mentions allowed
-    try {
-      await leaderboardMessage.edit({
-        content: "",
-        embeds,
-        allowedMentions: { parse: ["users"] },
-      });
-    } catch (err) {
-      console.error("Leaderboard update error:", err);
-      leaderboardMessage = await channel.send({
-        embeds,
-        allowedMentions: { parse: ["users"] },
-      });
-    }
-  }, 30000);
 }
 
 // ---------------- BUTTON HANDLING ----------------
@@ -635,6 +658,7 @@ client.on("messageCreate", async (message) => {
       playerData[userId].lp = lp;
       playerData[userId].IHP = getIHP(playerData[userId]);
       saveData();
+      await updateLeaderboardChannel(message.guild); // or channel.guild
       return message.reply(`✅ Force-registered <@${userId}> as **${tierText} ${lp} LP**`);
     } catch (err) {
       console.error(err);
@@ -684,6 +708,7 @@ client.on("messageCreate", async (message) => {
       playerData[userId].lp = lp;
       playerData[userId].IHP = getIHP(playerData[userId]);
       saveData();
+      await updateLeaderboardChannel(message.guild); // or channel.guild
       return message.reply(`✅ Registered ${message.author.username} as **${tierText} ${lp} LP**`);
     } catch (err) {
       console.error(err);
@@ -877,17 +902,21 @@ async function endMatch(channel, winner) {
   resetMutedUsers(); // Reset mute tracking for next match
 }
 
-function checkRankChange(id, announceChannel, player, oldIHP, oldRank, oldDivision) {
-  const newStats = IHPToRank(getIHP(player), oldRank, oldDivision);
+async function checkRankChange(id, announceChannel, player, oldIHP, oldRank, oldDivision) {
+  const newStats = IHPToRank(getIHP(player));
   Object.assign(player, newStats);
   const newIHP = getIHP(player);
 
   if (player.rank !== oldRank || player.division !== oldDivision) {
     if (newIHP > oldIHP) {
-      announceChannel.send(`🎉 <@${id}> ranked up to **${player.rank}${player.division ? " " + player.division : ""}**! 🏅`);
+      await announceChannel.send(`🎉 <@${id}> ranked up to **${player.rank}${player.division ? " " + player.division : ""}**! 🏅`);
     } else if (newIHP < oldIHP) {
-      announceChannel.send(`⬇️ <@${id}> has been demoted to **${player.rank}${player.division ? " " + player.division : ""}**.`);
+      await announceChannel.send(`⬇️ <@${id}> has been demoted to **${player.rank}${player.division ? " " + player.division : ""}**.`);
     }
+
+    // Update the leaderboard immediately
+    const guild = announceChannel.guild;
+    await updateLeaderboardChannel(guild);
   }
 }
 
