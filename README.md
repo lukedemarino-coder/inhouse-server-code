@@ -12,6 +12,8 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  StringSelectMenuBuilder, 
+  StringSelectMenuOptionBuilder
 } = require("discord.js");
 
 const client = new Client({
@@ -32,6 +34,7 @@ let matches = {};
 let playerData = loadData();
 let queueMessage;
 let leaderboardMessage;
+let activeReadyCheck = null;
 
 // ---------------- RANK SYSTEM ----------------
 const ranks = ["Iron", "Bronze", "Silver", "Gold", "Platinum", "Emerald", "Diamond"];
@@ -48,6 +51,11 @@ function getIHP(player) {
   return tierIndex * 400 + divisionValue + player.lp;
 }
 function IHPToRank(IHP) {
+  // Prevent going below the lowest possible value (Iron IV 0 LP)
+  if (IHP <= 0) {
+    return { rank: "Iron", division: 4, lp: 0 };
+  }
+
   if (IHP >= 2800) {
     // Master+
     const lp = IHP - 2800;
@@ -55,26 +63,21 @@ function IHPToRank(IHP) {
     if (lp >= 500) return { rank: "Grandmaster", division: null, lp };
     return { rank: "Master", division: null, lp };
   }
+
   const tierIndex = Math.floor(IHP / 400);
-  const tier = ranks[tierIndex];
+  const tier = ranks[tierIndex] || "Iron"; // default to Iron if somehow undefined
   let remainingIHP = IHP - tierIndex * 400;
   let division = 4;
   let lp = remainingIHP;
+
   while (lp >= 100 && division > 1) {
     lp -= 100;
     division--;
   }
-  // Promote tier if division < 1
-  if (division < 1) {
-    const tierIndex = ranks.indexOf(tier);
-    if (tierIndex + 1 < ranks.length) {
-      tier = ranks[tierIndex + 1];
-      division = 4;
-    } else {
-      // max tier reached, division stays 1
-      division = 1;
-    }
-  }
+
+  // Safety: if anything goes negative, reset to base Iron IV 0 LP
+  if (lp < 0) lp = 0;
+
   return { rank: tier, division, lp };
 }
 
@@ -92,6 +95,36 @@ function ensurePlayer(id) {
   }
   return playerData[id];
 }
+
+// ---------------- Role Selection -------------
+const ROLES = [
+  { label: "Top", value: "top" },
+  { label: "Jungle", value: "jungle" },
+  { label: "Mid", value: "mid" },
+  { label: "ADC", value: "adc" },
+  { label: "Support", value: "support" },
+];
+
+async function sendRoleSelection(user) {
+  const rows = [];
+
+  for (let i = 0; i < 5; i++) {
+    const select = new StringSelectMenuBuilder()
+      .setCustomId(`role_select_${i + 1}`) // 1 to 5
+      .setPlaceholder(`Select your ${i + 1}${i === 0 ? "st" : i === 1 ? "nd" : i === 2 ? "rd" : "th"} preferred role`)
+      .addOptions(
+        ROLES.map(r => new StringSelectMenuOptionBuilder().setLabel(r.label).setValue(r.value))
+      );
+
+    rows.push({ type: 1, components: [select] }); // ActionRow type 1
+  }
+
+  await user.send({
+    content: "🎮 Select your **5 preferred roles** in order (1 = most preferred, 5 = least preferred):",
+    components: rows
+  });
+}
+
 
 // ---------------- LEADERBOARD ----------------
 async function updateLeaderboardChannel(guild) {
@@ -129,6 +162,7 @@ async function updateLeaderboardChannel(guild) {
     const description = chunk
       .map((p, idx) => {
         const rankDiv = p.division ? `${p.rank} ${p.division}` : p.rank;
+        const lpLabel = "LP";
         const line1 = `#${i + idx + 1} • ${rankDiv} ${p.lp} LP`;
         const line2 = `<@${p.id}> | Elo: ${p.elo} | W: ${p.wins} | L: ${p.losses} | WR: ${p.wr}% | GP: ${p.gp}`;
         return `${line1}\n${line2}`;
@@ -177,62 +211,119 @@ async function updateLeaderboardChannel(guild) {
 async function startReadyCheck(channel) {
   const participants = [...queue];
   const ready = new Set();
+  const declined = new Set();
   const TIMEOUT = 60; // seconds
   let remaining = TIMEOUT;
 
   const embed = new EmbedBuilder()
     .setTitle("⚔️ Ready Check")
     .setDescription(
-      `10 players have queued!\n\nClick **✅ Ready** if you're ready.\nClick **❌ Not Ready** if you can't.\n\n⏳ Time remaining: ${remaining}s`
+      `${participants.length} players have queued!\n\nClick **✅ Ready** if you're ready.\nClick **❌ Decline** if you can't.\n\n⏳ Time remaining: ${remaining}s`
     )
     .setColor(0x00ffff)
     .setFooter({ text: `Waiting for players... | 0/${participants.length} ready` });
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("ready").setLabel("✅ Ready").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("notready").setLabel("❌ Not Ready").setStyle(ButtonStyle.Danger)
+    new ButtonBuilder()
+      .setCustomId("ready")
+      .setLabel("✅ Ready")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId("notready")
+      .setLabel("❌ Decline")
+      .setStyle(ButtonStyle.Danger)
   );
 
+  // Send initial message
   const msg = await channel.send({
     content: participants.map((id) => `<@${id}>`).join(" "),
     embeds: [embed],
     components: [row],
   });
 
+  // Create collector
   const collector = msg.createMessageComponentCollector({ time: TIMEOUT * 1000 });
 
-  // Start countdown interval
-  const countdown = setInterval(async () => {
+  // Countdown interval
+  let countdown = setInterval(async () => {
     remaining--;
     if (remaining < 0) return clearInterval(countdown);
+
     const updatedEmbed = EmbedBuilder.from(embed)
       .setFooter({ text: `✅ Ready: ${ready.size}/${participants.length}` })
       .setDescription(
-        `10 players have queued!\n\nClick **✅ Ready** if you're ready.\nClick **❌ Not Ready** if you can't.\n\n⏳ Time remaining: ${remaining}s`
+        `${participants.length} players have queued!\n\nClick **✅ Ready** if you're ready.\nClick **❌ Decline** if you can't.\n\n⏳ Time remaining: ${remaining}s`
       );
-    await msg.edit({ embeds: [updatedEmbed] }).catch(() => {});
+
+    if (declined.size > 0) {
+      updatedEmbed.addFields({
+        name: "❌ Declined",
+        value: Array.from(declined).map((id) => `<@${id}>`).join("\n"),
+      });
+    }
+
+    await msg.edit({ embeds: [updatedEmbed], components: [row] }).catch(() => {});
   }, 1000);
+
+  // Register active ready-check so !forceready can stop it
+  activeReadyCheck = { msg, collector, countdown };
 
   collector.on("collect", async (i) => {
     if (!participants.includes(i.user.id)) {
       return i.reply({ content: "You're not in this queue.", ephemeral: true });
     }
+
     if (i.customId === "notready") {
+      // Remove player from queue
       queue = queue.filter((id) => id !== i.user.id);
+      declined.add(i.user.id);
       saveData();
       await updateQueueMessage();
-      await msg.channel.send(`❌ <@${i.user.id}> declined the ready check. Match canceled.`);
+
+      await i.reply({
+        content: "❌ You have declined the queue. You have been removed from the queue.",
+        ephemeral: true,
+      }).catch(() => {});
+
+      // Update embed immediately
+      const updatedEmbed = EmbedBuilder.from(embed)
+        .setDescription(
+          `${participants.length} players have queued!\n\nClick **✅ Ready** if you're ready.\nClick **❌ Decline** if you can't.\n\n⏳ Time remaining: ${remaining}s`
+        )
+        .setFooter({ text: `✅ Ready: ${ready.size}/${participants.length}` });
+
+      if (declined.size > 0) {
+        updatedEmbed.addFields({
+          name: "❌ Declined",
+          value: Array.from(declined).map((id) => `<@${id}>`).join("\n"),
+        });
+      }
+
+      await msg.edit({ embeds: [updatedEmbed], components: [row] }).catch(() => {});
       collector.stop("declined");
-      await i.reply({ content: "You declined and have been removed from the queue.", ephemeral: true });
       return;
     }
 
+    // Mark ready
     ready.add(i.user.id);
-    await i.deferUpdate();
-    const updatedEmbed = EmbedBuilder.from(embed).setFooter({
-      text: `✅ Ready: ${ready.size}/${participants.length}`,
+    await i.deferUpdate().catch((err) => {
+      if (err.code !== 10062) console.error("Button deferUpdate error:", err);
     });
-    await msg.edit({ embeds: [updatedEmbed], components: [row] });
+
+    const updatedEmbed = EmbedBuilder.from(embed)
+      .setDescription(
+        `${participants.length} players have queued!\n\nClick **✅ Ready** if you're ready.\nClick **❌ Decline** if you can't.\n\n⏳ Time remaining: ${remaining}s`
+      )
+      .setFooter({ text: `✅ Ready: ${ready.size}/${participants.length}` });
+
+    if (declined.size > 0) {
+      updatedEmbed.addFields({
+        name: "❌ Declined",
+        value: Array.from(declined).map((id) => `<@${id}>`).join("\n"),
+      });
+    }
+
+    await msg.edit({ embeds: [updatedEmbed], components: [row] }).catch(() => {});
 
     if (ready.size === participants.length) {
       collector.stop("all_ready");
@@ -240,28 +331,39 @@ async function startReadyCheck(channel) {
   });
 
   collector.on("end", async (_, reason) => {
-    clearInterval(countdown); // stop countdown updates
-    if (reason === "all_ready") {
-      await msg.edit({
-        embeds: [
-          EmbedBuilder.from(embed)
-            .setDescription("✅ All players ready. Match is starting!")
-            .setColor(0x00ff00),
-        ],
-        components: [],
+    clearInterval(countdown);
+
+    const finalEmbed = EmbedBuilder.from(embed)
+      .setDescription(
+        reason === "all_ready"
+          ? "✅ All players ready. Match is starting!"
+          : reason === "declined"
+          ? "❌ A player declined the ready check. Match canceled."
+          : "⌛ Ready check timed out. Match canceled."
+      )
+      .setColor(
+        reason === "all_ready"
+          ? 0x00ff00
+          : reason === "declined"
+          ? 0xff0000
+          : 0xffa500
+      );
+
+    if (declined.size > 0) {
+      finalEmbed.addFields({
+        name: "❌ Declined",
+        value: Array.from(declined).map((id) => `<@${id}>`).join("\n"),
       });
+    }
+
+    await msg.edit({ embeds: [finalEmbed], components: [] }).catch(() => {});
+
+    if (reason === "all_ready") {
       await makeTeams(channel);
     } else if (reason === "declined") {
-      await msg.edit({
-        embeds: [
-          EmbedBuilder.from(embed)
-            .setDescription("❌ A player declined the ready check. Match canceled.")
-            .setColor(0xff0000),
-        ],
-        components: [],
-      });
       await updateQueueMessage();
     } else {
+      // Timeout: remove unready players
       const notReady = participants.filter((id) => !ready.has(id));
       if (notReady.length > 0) {
         queue = queue.filter((id) => !notReady.includes(id));
@@ -273,15 +375,10 @@ async function startReadyCheck(channel) {
             .join(", ")}`
         );
       }
-      await msg.edit({
-        embeds: [
-          EmbedBuilder.from(embed)
-            .setDescription("⌛ Ready check timed out. Match canceled.")
-            .setColor(0xffa500),
-        ],
-        components: [],
-      });
     }
+
+    // Clear active ready-check handle
+    activeReadyCheck = null;
   });
 }
 
@@ -432,71 +529,90 @@ async function updateQueueMessage() {
   await queueMessage.edit({ embeds: [embed], components: [row] });
 }
 
-// ---------------- BUTTON HANDLING ----------------
 client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isButton()) return;
   const id = interaction.user.id;
   ensurePlayer(id);
 
-  // --- Join Queue ---
-  if (interaction.customId === "join") {
-    // Require registration first
-    const player = playerData[id];
-    if (!player || !player.summonerName) {
-      return interaction.reply({
-        content: "❌ You must **register** first with !register <OP.GG link> before joining the queue.",
-        ephemeral: true,
-      });
+  // ---------------- BUTTONS ----------------
+  if (interaction.isButton()) {
+    // --- Join Queue ---
+    if (interaction.customId === "join") {
+      const player = playerData[id];
+      if (!player || !player.summonerName) {
+        return interaction.reply({
+          content: "❌ You must **register** first with !register <OP.GG link> before joining the queue.",
+          ephemeral: true,
+        });
+      }
+      if (queue.includes(id)) {
+        return interaction.reply({ content: "⚠️ You're already in the queue.", ephemeral: true });
+      }
+      queue.push(id);
+      saveData();
+      await updateQueueMessage();
+      if (queue.length >= QUEUE_SIZE) await startReadyCheck(interaction.channel);
+      return interaction.deferUpdate();
     }
-    if (queue.includes(id)) {
-      return interaction.reply({ content: "⚠️ You're already in the queue.", ephemeral: true });
+
+    // --- Leave Queue ---
+    if (interaction.customId === "leave") {
+      if (!queue.includes(id)) return interaction.deferUpdate(); // silently ignore
+      queue = queue.filter((x) => x !== id);
+      saveData();
+      await updateQueueMessage();
+      return interaction.deferUpdate();
     }
-    queue.push(id);
+
+    // --- Multi OP.GG ---
+    if (interaction.customId === "opgg") {
+      if (queue.length === 0) {
+        return interaction.reply({ content: "❌ The queue is empty.", ephemeral: true });
+      }
+      const summoners = queue
+        .map((id) => playerData[id]?.summonerName)
+        .filter(Boolean)
+        .map((url) => {
+          try {
+            const parts = url.split("/");
+            const namePart = decodeURIComponent(parts[parts.length - 1]);
+            return namePart.replace("-", "%23").replace(/\s+/g, "+");
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean);
+
+      if (summoners.length === 0) {
+        return interaction.reply({ content: "❌ No registered OP.GG links found.", ephemeral: true });
+      }
+
+      const multiLink = `https://www.op.gg/lol/multisearch/na?summoners=${summoners.join("%2C")}`;
+      return interaction.reply({ content: `🌐 [Multi OP.GG Link for Queue](${multiLink})`, ephemeral: true });
+    }
+
+    // --- End Match ---
+    if (interaction.customId === "endmatch") {
+      return endMatch(interaction.channel, "manual");
+    }
+  }
+
+  // ---------------- SELECT MENUS ----------------
+  else if (interaction.isStringSelectMenu()) {
+    const userId = interaction.user.id;
+    ensurePlayer(userId);
+
+    if (!playerData[userId].roles) playerData[userId].roles = [];
+
+    // parse the slot number from customId: role_select_<userId>_<1-5>
+    const parts = interaction.customId.split("_");
+    const slot = parseInt(parts[3]) - 1; // 0-4
+    playerData[userId].roles[slot] = interaction.values[0]; // store role
     saveData();
-    await updateQueueMessage();
-    if (queue.length >= QUEUE_SIZE) {
-      await startReadyCheck(interaction.channel);
-    }
-    await interaction.deferUpdate(); // prevents “interaction failed” message
-  }
 
-  // --- Leave Queue ---
-  else if (interaction.customId === "leave") {
-    if (!queue.includes(id)) return; // silently ignore
-    queue = queue.filter((x) => x !== id);
-    saveData();
-    await updateQueueMessage();
-    await interaction.deferUpdate(); // prevents “interaction failed” message
-  }
-
-  // --- Multi OP.GG Button ---
-  else if (interaction.customId === "opgg") {
-    if (queue.length === 0) {
-      return interaction.reply({ content: "❌ The queue is empty.", ephemeral: true });
-    }
-    const summoners = queue
-      .map((id) => playerData[id]?.summonerName)
-      .filter(Boolean)
-      .map((url) => {
-        try {
-          const parts = url.split("/");
-          const namePart = decodeURIComponent(parts[parts.length - 1]);
-          return namePart.replace("-", "%23").replace(/\s+/g, "+");
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean);
-    if (summoners.length === 0) {
-      return interaction.reply({ content: "❌ No registered OP.GG links found.", ephemeral: true });
-    }
-    const multiLink = `https://www.op.gg/lol/multisearch/na?summoners=${summoners.join("%2C")}`;
-    return interaction.reply({ content: `🌐 [Multi OP.GG Link for Queue](${multiLink})`, ephemeral: true });
-  }
-
-  // --- End Match ---
-  else if (interaction.customId === "endmatch") {
-    return endMatch(interaction.channel, "manual");
+    await interaction.reply({
+      content: `✅ Saved your role choice for slot #${slot + 1}: ${interaction.values[0]}`,
+      ephemeral: true,
+    });
   }
 });
 
@@ -517,26 +633,42 @@ client.on("messageCreate", async (message) => {
 
   // ---------------- !forceready ----------------
   if (cmd === "!forceready") {
-    if (!message.member.permissions.has("ManageGuild")) {
-      return message.reply("❌ Only staff members can use this command.");
-    }
-    // Force everyone in the ready check to be ready and start the match
-    if (!queue || queue.length < QUEUE_SIZE) {
-      return message.reply("⚠️ There isn't an active ready check right now.");
-    }
-    message.channel.send("✅ Force-ready activated — all players are now marked ready!");
-    await makeTeams(message.channel);
+  if (!message.member.permissions.has("ManageGuild")) {
+    return message.reply("❌ Only staff members can use this command.");
   }
 
-  if (cmd === "!clearqueue") {
-    if (!message.member.permissions.has("ManageGuild")) {
-      return message.reply("❌ You need Manage Server permissions to do that.");
-    }
-    queue = [];
-    saveData();
-    message.channel.send("✅ Queue has been cleared.");
-    await updateQueueMessage();
+  if (!queue || queue.length < QUEUE_SIZE) {
+    return message.reply("⚠️ There isn't an active ready check right now.");
   }
+
+  message.channel.send("✅ Force-ready activated — all players are now marked ready!");
+
+  // If there's an active ready-check, stop its collector so the existing
+  // end-handler runs (it will call makeTeams). This avoids duplicate calls.
+  if (activeReadyCheck && activeReadyCheck.collector) {
+    try {
+      // Optionally edit the message for immediate feedback and remove buttons
+      const curMsg = activeReadyCheck.msg;
+      try {
+        const infoEmbed = EmbedBuilder.from(curMsg.embeds?.[0] || embed)
+          .setDescription("✅ Force-ready activated by staff. Match is starting!")
+          .setColor(0x00ff00);
+        await curMsg.edit({ embeds: [infoEmbed], components: [] }).catch(() => {});
+      } catch (e) { /* ignore UI edit errors */ }
+
+      // Stop collector — use same reason as normal "all_ready" path
+      activeReadyCheck.collector.stop("all_ready");
+      // don't call makeTeams() here — collector.on('end') will do it.
+    } catch (err) {
+      console.error("Error stopping active ready check:", err);
+      // fallback: if something went wrong and no collector, call makeTeams
+      await makeTeams(message.channel);
+    }
+  } else {
+    // No active ready-check object (maybe message not cached) — fallback:
+    await makeTeams(message.channel);
+  }
+}
 
   if (cmd === "!remove") {
     if (!message.member.permissions.has("ManageGuild")) {
@@ -670,50 +802,69 @@ client.on("messageCreate", async (message) => {
 // ---------------- !register ----------------
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
-  if (message.content.startsWith("!register")) {
-    const userId = message.author.id;
-    if (playerData[userId] && playerData[userId].summonerName) {
-      return message.reply("❌ You have already registered an account.");
+  if (!message.content.startsWith("!register")) return;
+
+  const userId = message.author.id;
+  if (playerData[userId] && playerData[userId].summonerName) {
+    return message.reply("❌ You have already registered an account.");
+  }
+
+  const parts = message.content.split(" ");
+  if (parts.length < 2) return message.reply("Usage: !register <OP.GG link>");
+  const url = parts[1];
+  if (!url.includes("op.gg")) return message.reply("❌ Please provide a valid OP.GG link.");
+
+  try {
+    const res = await axios.get(url);
+    const $ = cheerio.load(res.data);
+    const tierText = $("strong.text-xl").first().text().trim();
+    const lpText = $("span.text-xs.text-gray-500").first().text().trim();
+    const lp = parseInt(lpText);
+    if (!tierText || isNaN(lp)) return message.reply("❌ Could not parse rank/LP from OP.GG.");
+
+    let rank, division;
+    const tierParts = tierText.trim().split(/\s+/);
+    if (tierParts.length === 2) {
+      rank = tierParts[0].charAt(0).toUpperCase() + tierParts[0].slice(1).toLowerCase();
+      const divText = tierParts[1].toUpperCase();
+      const romanToNumber = { IV: 4, III: 3, II: 2, I: 1 };
+      division = !isNaN(parseInt(divText)) ? parseInt(divText) : romanToNumber[divText] || 4;
+    } else {
+      rank = tierParts[0].charAt(0).toUpperCase() + tierParts[0].slice(1).toLowerCase();
+      division = null;
     }
-    const parts = message.content.split(" ");
-    if (parts.length < 2) return message.reply("Usage: !register <OP.GG link>");
-    const url = parts[1];
-    if (!url.includes("op.gg")) return message.reply("❌ Please provide a valid OP.GG link.");
-    try {
-      const res = await axios.get(url);
-      const $ = cheerio.load(res.data);
-      const tierText = $("strong.text-xl").first().text().trim();
-      const lpText = $("span.text-xs.text-gray-500").first().text().trim();
-      const lp = parseInt(lpText);
-      if (!tierText || isNaN(lp)) return message.reply("❌ Could not parse rank/LP from OP.GG.");
-      let rank, division;
-      const tierParts = tierText.trim().split(/\s+/);
-      if (tierParts.length === 2) {
-        rank = tierParts[0].charAt(0).toUpperCase() + tierParts[0].slice(1).toLowerCase();
-        const divText = tierParts[1].toUpperCase();
-        const romanToNumber = { IV: 4, III: 3, II: 2, I: 1 };
-        if (!isNaN(parseInt(divText))) {
-          division = parseInt(divText);
-        } else {
-          division = romanToNumber[divText] || 4;
-        }
-      } else {
-        rank = tierParts[0].charAt(0).toUpperCase() + tierParts[0].slice(1).toLowerCase();
-        division = null;
-      }
-      ensurePlayer(userId);
-      playerData[userId].summonerName = url;
-      playerData[userId].rank = rank;
-      playerData[userId].division = division;
-      playerData[userId].lp = lp;
-      playerData[userId].IHP = getIHP(playerData[userId]);
-      saveData();
-      await updateLeaderboardChannel(message.guild); // or channel.guild
-      return message.reply(`✅ Registered ${message.author.username} as **${tierText} ${lp} LP**`);
-    } catch (err) {
-      console.error(err);
-      return message.reply("❌ Failed to fetch OP.GG page. Make sure the link is correct.");
+
+    ensurePlayer(userId);
+    playerData[userId].summonerName = url;
+    playerData[userId].rank = rank;
+    playerData[userId].division = division;
+    playerData[userId].lp = lp;
+    playerData[userId].IHP = getIHP(playerData[userId]);
+    saveData();
+    await updateLeaderboardChannel(message.guild);
+
+    await message.reply(`✅ Registered ${message.author.username} as **${tierText} ${lp} LP**`);
+
+    // ---------------- Role Selection Dropdowns ----------------
+    const rows = [];
+    for (let i = 0; i < 5; i++) {
+      const selectMenu = new StringSelectMenuBuilder()
+        .setCustomId(`role_select_${userId}_${i + 1}`) // unique per user
+        .setPlaceholder(`Select your ${i + 1}${i === 0 ? "st" : i === 1 ? "nd" : i === 2 ? "rd" : "th"} preferred role`)
+        .addOptions(
+          ROLES.map(r => ({ label: r.label, value: r.value }))
+        );
+      rows.push(new ActionRowBuilder().addComponents(selectMenu));
     }
+
+    await message.channel.send({
+      content: `${message.author}, please select your **5 preferred roles** (1 = most preferred, 5 = least preferred):`,
+      components: rows
+    });
+
+  } catch (err) {
+    console.error(err);
+    return message.reply("❌ Failed to fetch OP.GG page. Make sure the link is correct.");
   }
 });
 
@@ -866,9 +1017,8 @@ async function endMatch(channel, winner) {
 
     p.losses++;
     p.lp -= 20;
-    // LP can go negative temporarily; demotion logic handles it
+
     checkRankChange(id, general, p, oldIHP, oldRank, oldDivision);
-    if (p.lp < 0) p.lp = 0; // Display purposes
   });
 
   saveData();
@@ -903,20 +1053,23 @@ async function endMatch(channel, winner) {
 }
 
 async function checkRankChange(id, announceChannel, player, oldIHP, oldRank, oldDivision) {
-  const newStats = IHPToRank(getIHP(player));
+  const newStats = IHPToRank(getIHP(player), player); // pass current player
   Object.assign(player, newStats);
+
   const newIHP = getIHP(player);
 
   if (player.rank !== oldRank || player.division !== oldDivision) {
     if (newIHP > oldIHP) {
-      await announceChannel.send(`🎉 <@${id}> ranked up to **${player.rank}${player.division ? " " + player.division : ""}**! 🏅`);
+      await announceChannel.send(
+        `🎉 <@${id}> ranked up to **${player.rank}${player.division ? " " + player.division : ""}**! 🏅`
+      );
     } else if (newIHP < oldIHP) {
-      await announceChannel.send(`⬇️ <@${id}> has been demoted to **${player.rank}${player.division ? " " + player.division : ""}**.`);
+      await announceChannel.send(
+        `⬇️ <@${id}> has been demoted to **${player.rank}${player.division ? " " + player.division : ""}**.`
+      );
     }
 
-    // Update the leaderboard immediately
-    const guild = announceChannel.guild;
-    await updateLeaderboardChannel(guild);
+    await updateLeaderboardChannel(announceChannel.guild);
   }
 }
 
