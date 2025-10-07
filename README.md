@@ -3,6 +3,7 @@ require("dotenv").config();
 const fs = require("fs");
 const axios = require("axios");
 const cheerio = require("cheerio");
+const puppeteer = require("puppeteer");
 const {
   Client,
   GatewayIntentBits,
@@ -34,7 +35,6 @@ let leaderboardMessage;
 
 // ---------------- RANK SYSTEM ----------------
 const ranks = ["Iron", "Bronze", "Silver", "Gold", "Platinum", "Emerald", "Diamond"];
-
 function getIHP(player) {
   if (["Master", "Grandmaster", "Challenger"].includes(player.rank)) {
     return 2800 + player.lp;
@@ -47,7 +47,6 @@ function getIHP(player) {
   }
   return tierIndex * 400 + divisionValue + player.lp;
 }
-
 function IHPToRank(IHP) {
   if (IHP >= 2800) {
     // Master+
@@ -84,11 +83,9 @@ function loadData() {
   if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE));
   return {};
 }
-
 function saveData() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(playerData, null, 2));
 }
-
 function ensurePlayer(id) {
   if (!playerData[id]) {
     playerData[id] = { rank: "Iron", division: 4, lp: 0, wins: 0, losses: 0 };
@@ -96,53 +93,254 @@ function ensurePlayer(id) {
   return playerData[id];
 }
 
+// ---------------- READY CHECK ----------------
+async function startReadyCheck(channel) {
+  const participants = [...queue];
+  const ready = new Set();
+  const TIMEOUT = 60000; // 60 seconds to confirm
+  const embed = new EmbedBuilder()
+    .setTitle("⚔️ Ready Check")
+    .setDescription(
+      "10 players have queued!\n\n" +
+        "Click **✅ Ready** if you're ready to play.\n" +
+        "Click **❌ Not Ready** if you can't.\n\n" +
+        `⏳ You have ${TIMEOUT / 1000} seconds.`
+    )
+    .setColor(0x00ffff)
+    .setFooter({ text: "Waiting for players..." });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("ready").setLabel("✅ Ready").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("notready").setLabel("❌ Not Ready").setStyle(ButtonStyle.Danger)
+  );
+
+  const msg = await channel.send({
+    content: participants.map((id) => `<@${id}>`).join(" "),
+    embeds: [embed],
+    components: [row],
+  });
+
+  const collector = msg.createMessageComponentCollector({ time: TIMEOUT });
+
+  collector.on("collect", async (i) => {
+    if (!participants.includes(i.user.id)) {
+      return i.reply({ content: "You're not in this queue.", ephemeral: true });
+    }
+    if (i.customId === "notready") {
+      // ❌ Someone declined → instantly cancel and remove them from queue
+      queue = queue.filter((id) => id !== i.user.id);
+      saveData();
+      await updateQueueMessage();
+      // Announce who declined to the channel
+      await msg.channel.send(`❌ <@${i.user.id}> declined the ready check. Match canceled.`);
+      collector.stop("declined");
+      await i.reply({ content: "You declined and have been removed from the queue.", ephemeral: true });
+      return;
+    }
+    // ✅ Player readied up
+    ready.add(i.user.id);
+    await i.deferUpdate();
+    const updatedEmbed = EmbedBuilder.from(embed).setFooter({
+      text: `✅ Ready: ${ready.size}/${participants.length}`,
+    });
+    await msg.edit({ embeds: [updatedEmbed], components: [row] });
+    if (ready.size === participants.length) {
+      collector.stop("all_ready");
+    }
+  });
+
+  collector.on("end", async (_, reason) => {
+    if (reason === "all_ready") {
+      await msg.edit({
+        embeds: [
+          EmbedBuilder.from(embed)
+            .setDescription("✅ All players ready. Match is starting!")
+            .setColor(0x00ff00),
+        ],
+        components: [],
+      });
+      await makeTeams(channel);
+    } else if (reason === "declined") {
+      await msg.edit({
+        embeds: [
+          EmbedBuilder.from(embed)
+            .setDescription("❌ A player declined the ready check. Match canceled.")
+            .setColor(0xff0000),
+        ],
+        components: [],
+      });
+      await updateQueueMessage(); // keep queue intact
+    } else {
+      // ⌛ Ready check timed out — remove AFK players
+      const notReady = participants.filter((id) => !ready.has(id));
+      // Remove all not-ready (AFK) players from the queue
+      if (notReady.length > 0) {
+        queue = queue.filter((id) => !notReady.includes(id));
+        saveData();
+        await updateQueueMessage();
+        await msg.channel.send(
+          `⌛ Ready check timed out. The following players did not respond and were removed from the queue:\n${notReady
+            .map((id) => `<@${id}>`)
+            .join(", ")}`
+        );
+      }
+      await msg.edit({
+        embeds: [
+          EmbedBuilder.from(embed)
+            .setDescription("⌛ Ready check timed out. Match canceled.")
+            .setColor(0xffa500),
+        ],
+        components: [],
+      });
+    }
+  });
+}
+
+async function createDraftLolLobby() {
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+  await page.goto("https://draftlol.dawe.gg/");
+  // Click "Create Lobby"
+  await page.waitForSelector("div.sendButton");
+  await page.click("div.sendButton");
+  // Wait for blue and red inputs
+  await page.waitForSelector(".createContainer input.inputBlue");
+  await page.waitForSelector(".createContainer input.inputRed");
+  // Wait for spectator input (any input that is not blue or red)
+  await page.waitForFunction(() => {
+    const container = document.querySelector(".createContainer");
+    if (!container) return false;
+    const inputs = Array.from(container.querySelectorAll("input[type=text]"));
+    return inputs.some((input) => !input.classList.contains("inputBlue") && !input.classList.contains("inputRed"));
+  });
+  // Grab all three links
+  const links = await page.evaluate(() => {
+    const container = document.querySelector(".createContainer");
+    if (!container) return { blue: "", red: "", spectator: "" };
+    const blue = container.querySelector(".inputBlue")?.value || "";
+    const red = container.querySelector(".inputRed")?.value || "";
+    const inputs = Array.from(container.querySelectorAll("input[type=text]"));
+    const spectatorInput = inputs.find(
+      (input) => !input.classList.contains("inputBlue") && !input.classList.contains("inputRed")
+    );
+    const spectator = spectatorInput?.value || "";
+    return { blue, red, spectator };
+  });
+  await browser.close();
+  return links;
+}
+
+// --- Mute Logic ---
+const mutedUsers = new Set(); // users currently muted BY THE BOT
+
 client.on("voiceStateUpdate", async (oldState, newState) => {
-  const member = newState.member;
   if (!matches.current) return;
   const { team1, team2, team1VC, team2VC } = matches.current;
+  const member = newState.member;
+  if (!member || member.user.bot) return;
+
   const newVC = newState.channelId;
-  if (!newVC) return; // left VC
-  let allowedTeam = null;
-  if (newVC === team1VC.id) allowedTeam = team1;
-  if (newVC === team2VC.id) allowedTeam = team2;
+  const oldVC = oldState.channelId;
+
   try {
-    if (allowedTeam) {
-      // user is in a match VC
-      if (!allowedTeam.includes(member.id)) {
-        if (!newState.serverMute) await newState.setMute(true, "Not on this team");
+    // User left all channels → unmute if bot muted them
+    if (!newVC) {
+      if (mutedUsers.has(member.id) && member.voice.serverMute) {
+        await member.voice.setMute(false, "Left VC");
+        mutedUsers.delete(member.id);
+      }
+      return;
+    }
+
+    const isTeam1VC = newVC === team1VC.id;
+    const isTeam2VC = newVC === team2VC.id;
+    const allowed = (isTeam1VC && team1.includes(member.id)) || (isTeam2VC && team2.includes(member.id));
+
+    if (isTeam1VC || isTeam2VC) {
+      if (!allowed) {
+        // Only mute if bot hasn't already muted them manually
+        if (!mutedUsers.has(member.id) && !member.voice.serverMute) {
+          await member.voice.setMute(true, "Joined wrong team VC");
+          mutedUsers.add(member.id);
+        }
       } else {
-        if (newState.serverMute) await newState.setMute(false, "Player on correct team");
+        // Only unmute if bot muted them previously
+        if (mutedUsers.has(member.id)) {
+          await member.voice.setMute(false, "Joined correct team VC");
+          mutedUsers.delete(member.id);
+        }
       }
     } else {
-      // user is in some other VC
-      if (newState.serverMute) await newState.setMute(false, "Not a match VC");
+      // Outside match VC → unmute if bot muted them
+      if (mutedUsers.has(member.id) && member.voice.serverMute) {
+        await member.voice.setMute(false, "Outside match VC");
+        mutedUsers.delete(member.id);
+      }
     }
   } catch (err) {
-    console.error("Failed to mute/unmute member:", err);
+    console.error("voiceStateUpdate error:", err);
   }
 });
+
+// Reset between matches
+function resetMutedUsers() {
+  mutedUsers.clear();
+}
+
+function buildQueueEmbed() {
+  const embed = new EmbedBuilder()
+    .setTitle("🎮 Current Queue")
+    .setColor(0x00ff00)
+    .setDescription(
+      queue.length ? queue.map((id, i) => `${i + 1}. <@${id}>`).join("\n") : "The queue is currently empty."
+    )
+    .setFooter({ text: `Queue Size: ${queue.length}/${QUEUE_SIZE}` })
+    .setTimestamp();
+  return embed;
+}
 
 // ---------------- QUEUE EMBED ----------------
 async function postQueueMessage(channel) {
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("join").setLabel("✅ Join Queue").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("leave").setLabel("🚪 Leave Queue").setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId("leave").setLabel("🚪 Leave Queue").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("opgg").setLabel("🌐 Multi OP.GG").setStyle(ButtonStyle.Primary) // blue button
   );
+
   const embed = buildQueueEmbed();
   queueMessage = await channel.send({ embeds: [embed], components: [row] });
 }
 
-function buildQueueEmbed() {
-  const playerList = queue.length > 0 ? queue.map((id, i) => `${i + 1}. <@${id}>`).join("\n") : "No players in queue.";
-  return new EmbedBuilder()
-    .setTitle("League Inhouse Queue")
-    .setDescription(`Use the buttons below to join or leave the queue.\n\n + **Current:** ${queue.length}/${QUEUE_SIZE}\n\n${playerList}`);
-}
-
 async function updateQueueMessage() {
   if (!queueMessage) return;
+
+  // dynamically rebuild the Multi OP.GG link
+  const getMultiOPGG = () => {
+    const summoners = queue
+      .map((id) => playerData[id]?.summonerName)
+      .filter(Boolean)
+      .map((url) => {
+        try {
+          const parts = url.split("/");
+          const namePart = decodeURIComponent(parts[parts.length - 1]);
+          return namePart.replace("-", "%23").replace(/\s+/g, "+");
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+    if (summoners.length === 0) return "https://www.op.gg/";
+    return `https://www.op.gg/lol/multisearch/na?summoners=${summoners.join("%2C")}`;
+  };
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("join").setLabel("✅ Join Queue").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("leave").setLabel("🚪 Leave Queue").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setLabel("🌐 Multi OP.GG").setStyle(ButtonStyle.Link).setURL(getMultiOPGG())
+  );
+
   const embed = buildQueueEmbed();
-  await queueMessage.edit({ embeds: [embed], components: queueMessage.components });
+  await queueMessage.edit({ embeds: [embed], components: [row] });
 }
 
 // ---------------- LEADERBOARD ----------------
@@ -151,31 +349,63 @@ async function updateLeaderboardChannel(guild) {
   if (!channel) {
     channel = await guild.channels.create({ name: "leaderboard", type: 0 });
   }
+
+  // Fetch or create initial leaderboard message
   if (!leaderboardMessage) {
     leaderboardMessage = await channel.send({ content: "Loading leaderboard..." });
   }
-  setInterval(() => {
+
+  setInterval(async () => {
     const players = Object.entries(playerData).map(([id, p]) => {
       const games = (p.wins || 0) + (p.losses || 0);
       const wr = games > 0 ? ((p.wins / games) * 100).toFixed(1) : "0.0";
       return { id, ...p, IHP: getIHP(p), games, wr };
     });
-    // Sort by IHP descending
+
     players.sort((a, b) => b.IHP - a.IHP);
-    const embed = new EmbedBuilder()
-      .setTitle("🏆 Leaderboard")
-      .setColor(0x808080)
-      .setTimestamp();
-    // Add each player as a separate field
-    players.forEach((p, i) => {
-      const rankText = p.division ? `${p.rank} ${p.division} ${p.lp} LP` : `${p.rank} ${p.lp} LP`;
-      embed.addFields({
-        name: `**${i + 1}. <@${p.id}> - ${rankText}** | Elo: ${p.IHP} | W: ${p.wins || 0} | L: ${p.losses || 0} | WR: ${p.wr}% | GP: ${p.games}`,
-        value: "\u200B",
-        inline: false,
+
+    // Split into chunks of 25 (Discord embed limit)
+    const chunkSize = 25;
+    const chunks = [];
+    for (let i = 0; i < players.length; i += chunkSize) {
+      chunks.push(players.slice(i, i + chunkSize));
+    }
+
+    // Build embeds
+    const embeds = chunks.map((chunk, chunkIndex) => {
+      const embed = new EmbedBuilder()
+        .setTitle(chunkIndex === 0 ? "🏆 Leaderboard" : `🏆 Leaderboard (Page ${chunkIndex + 1})`)
+        .setColor(0x808080)
+        .setTimestamp();
+
+      chunk.forEach((p, i) => {
+        const rankText = p.division
+          ? `${p.rank} ${p.division} ${p.lp} LP`
+          : `${p.rank} ${p.lp} LP`;
+
+        embed.addFields({
+          name: `**${chunkIndex * chunkSize + i + 1}. <@${p.id}> - ${rankText}**`,
+          value: `Elo: ${p.IHP} | W: ${p.wins || 0} | L: ${p.losses || 0} | WR: ${p.wr}% | GP: ${p.games}`,
+        });
       });
+
+      return embed;
     });
-    leaderboardMessage.edit({ embeds: [embed] });
+
+    // Edit message with mentions allowed
+    try {
+      await leaderboardMessage.edit({
+        content: "",
+        embeds,
+        allowedMentions: { parse: ["users"] },
+      });
+    } catch (err) {
+      console.error("Leaderboard update error:", err);
+      leaderboardMessage = await channel.send({
+        embeds,
+        allowedMentions: { parse: ["users"] },
+      });
+    }
   }, 30000);
 }
 
@@ -184,22 +414,65 @@ client.on("interactionCreate", async (interaction) => {
   if (!interaction.isButton()) return;
   const id = interaction.user.id;
   ensurePlayer(id);
+
+  // --- Join Queue ---
   if (interaction.customId === "join") {
-    if (queue.includes(id)) return interaction.reply({ content: "Already in queue.", ephemeral: true });
+    // Require registration first
+    const player = playerData[id];
+    if (!player || !player.summonerName) {
+      return interaction.reply({
+        content: "❌ You must **register** first with !register <OP.GG link> before joining the queue.",
+        ephemeral: true,
+      });
+    }
+    if (queue.includes(id)) {
+      return interaction.reply({ content: "⚠️ You're already in the queue.", ephemeral: true });
+    }
     queue.push(id);
     saveData();
-    await interaction.reply({ content: `You joined! (${queue.length}/${QUEUE_SIZE})`, ephemeral: true });
     await updateQueueMessage();
-    if (queue.length >= QUEUE_SIZE) makeTeams(interaction.channel);
+    if (queue.length >= QUEUE_SIZE) {
+      await startReadyCheck(interaction.channel);
+    }
+    await interaction.deferUpdate(); // prevents “interaction failed” message
   }
-  if (interaction.customId === "leave") {
-    if (!queue.includes(id)) return interaction.reply({ content: "Not in queue.", ephemeral: true });
+
+  // --- Leave Queue ---
+  else if (interaction.customId === "leave") {
+    if (!queue.includes(id)) return; // silently ignore
     queue = queue.filter((x) => x !== id);
     saveData();
-    await interaction.reply({ content: `You left. (${queue.length}/${QUEUE_SIZE})`, ephemeral: true });
     await updateQueueMessage();
+    await interaction.deferUpdate(); // prevents “interaction failed” message
   }
-  if (interaction.customId === "endmatch") {
+
+  // --- Multi OP.GG Button ---
+  else if (interaction.customId === "opgg") {
+    if (queue.length === 0) {
+      return interaction.reply({ content: "❌ The queue is empty.", ephemeral: true });
+    }
+    const summoners = queue
+      .map((id) => playerData[id]?.summonerName)
+      .filter(Boolean)
+      .map((url) => {
+        try {
+          const parts = url.split("/");
+          const namePart = decodeURIComponent(parts[parts.length - 1]);
+          return namePart.replace("-", "%23").replace(/\s+/g, "+");
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+    if (summoners.length === 0) {
+      return interaction.reply({ content: "❌ No registered OP.GG links found.", ephemeral: true });
+    }
+    const multiLink = `https://www.op.gg/lol/multisearch/na?summoners=${summoners.join("%2C")}`;
+    return interaction.reply({ content: `🌐 [Multi OP.GG Link for Queue](${multiLink})`, ephemeral: true });
+  }
+
+  // --- End Match ---
+  else if (interaction.customId === "endmatch") {
     return endMatch(interaction.channel, "manual");
   }
 });
@@ -219,6 +492,19 @@ client.on("messageCreate", async (message) => {
     await updateQueueMessage();
   }
 
+  // ---------------- !forceready ----------------
+  if (cmd === "!forceready") {
+    if (!message.member.permissions.has("ManageGuild")) {
+      return message.reply("❌ Only staff members can use this command.");
+    }
+    // Force everyone in the ready check to be ready and start the match
+    if (!queue || queue.length < QUEUE_SIZE) {
+      return message.reply("⚠️ There isn't an active ready check right now.");
+    }
+    message.channel.send("✅ Force-ready activated — all players are now marked ready!");
+    await makeTeams(message.channel);
+  }
+
   if (cmd === "!clearqueue") {
     if (!message.member.permissions.has("ManageGuild")) {
       return message.reply("❌ You need Manage Server permissions to do that.");
@@ -228,6 +514,63 @@ client.on("messageCreate", async (message) => {
     message.channel.send("✅ Queue has been cleared.");
     await updateQueueMessage();
   }
+
+  if (cmd === "!remove") {
+    if (!message.member.permissions.has("ManageGuild")) {
+      return message.reply("❌ You need Manage Server permissions to do that.");
+    }
+    const userMention = args[0];
+    if (!userMention) return message.reply("Usage: !removefromqueue <@user>");
+    const userId = userMention.replace(/[<@!>]/g, "");
+    if (!queue.includes(userId)) {
+      return message.reply("⚠️ That user is not in the queue.");
+    }
+    queue = queue.filter((id) => id !== userId);
+    saveData();
+    await updateQueueMessage();
+    return message.channel.send(`🚫 Removed <@${userId}> from the queue.`);
+  }
+
+  if (cmd === "!cancelmatch") {
+  // Only allow staff (ManageGuild permission) to run this command
+  if (!message.member.permissions.has("ManageGuild")) {
+    return message.reply("❌ Only staff members can use this command.");
+  }
+
+  // If no active match exists
+  if (!matches.current) {
+    return message.reply("⚠️ There is no active match to cancel.");
+  }
+
+  const { matchChannel, team1VC, team2VC } = matches.current;
+  const guild = message.guild;
+
+  // Use #general as the safe channel for confirmation
+  const safeChannel = guild.channels.cache.find(c => c.name === "general" && c.type === 0) || message.channel;
+
+  try {
+    // Delete all match-related channels if they still exist
+    if (matchChannel) await matchChannel.delete().catch(() => {});
+    if (team1VC) await team1VC.delete().catch(() => {});
+    if (team2VC) await team2VC.delete().catch(() => {});
+
+    // Optionally delete the match category (if it exists and is empty)
+    const matchCategory = guild.channels.cache.find(c => c.type === 4 && c.name.toLowerCase() === "match");
+    if (matchCategory) await matchCategory.delete().catch(() => {});
+
+    // Reset active match reference
+    matches.current = null;
+
+    // Reset mute tracking for the next match
+    resetMutedUsers();
+
+    // Send confirmation safely to general
+    await safeChannel.send("🛑 The current match has been canceled and all match channels have been deleted.");
+  } catch (err) {
+    console.error("Error canceling match:", err);
+    await safeChannel.send("⚠️ Failed to fully cancel the match. Check console for details.");
+  }
+}
 
   if (cmd === "!simulate") {
     const count = parseInt(args[0] || "10");
@@ -242,8 +585,14 @@ client.on("messageCreate", async (message) => {
   }
 
   if (cmd === "!endmatch") {
+    // Only allow staff (ManageGuild permission) to run this command
+    if (!message.member.permissions.has("ManageGuild")) {
+      return message.reply("❌ Only staff members can use this command.");
+    }
     const team = args[0];
-    if (!team || !matches.current) return message.reply("Usage: !endmatch <1|2>");
+    if (!team || !matches.current) {
+      return message.reply("Usage: !endmatch <1|2>");
+    }
     endMatch(message.channel, team);
   }
 
@@ -273,7 +622,7 @@ client.on("messageCreate", async (message) => {
       if (tierParts.length === 2) {
         rank = tierParts[0].charAt(0).toUpperCase() + tierParts[0].slice(1).toLowerCase();
         const divText = tierParts[1].toUpperCase();
-        const romanToNumber = { "IV": 4, "III": 3, "II": 2, "I": 1 };
+        const romanToNumber = { IV: 4, III: 3, II: 2, I: 1 };
         division = !isNaN(parseInt(divText)) ? parseInt(divText) : romanToNumber[divText] || 4;
       } else {
         rank = tierParts[0].charAt(0).toUpperCase() + tierParts[0].slice(1).toLowerCase();
@@ -318,7 +667,7 @@ client.on("messageCreate", async (message) => {
       if (tierParts.length === 2) {
         rank = tierParts[0].charAt(0).toUpperCase() + tierParts[0].slice(1).toLowerCase();
         const divText = tierParts[1].toUpperCase();
-        const romanToNumber = { "IV": 4, "III": 3, "II": 2, "I": 1 };
+        const romanToNumber = { IV: 4, III: 3, II: 2, I: 1 };
         if (!isNaN(parseInt(divText))) {
           division = parseInt(divText);
         } else {
@@ -369,37 +718,22 @@ async function makeTeams(channel) {
       combine(arr, k, i + 1, [...path, i]);
     }
   }
-  combine(players.map((_, i) => i), 5);
 
+  combine(players.map((_, i) => i), 5);
   const avg1 = Math.round(bestTeam1.reduce((a, id) => a + getIHP(ensurePlayer(id)), 0) / 5);
   const avg2 = Math.round(bestTeam2.reduce((a, id) => a + getIHP(ensurePlayer(id)), 0) / 5);
 
   // ---------------- CREATE MATCH CATEGORY + CHANNELS ----------------
   const guild = channel.guild;
   let matchCategory = guild.channels.cache.find(
-    c => c.type === 4 && c.name.toLowerCase() === "match"
+    (c) => c.type === 4 && c.name.toLowerCase() === "match"
   );
   if (!matchCategory) {
     matchCategory = await guild.channels.create({ name: "Match", type: 4 });
   }
-
-  const matchChannel = await guild.channels.create({
-    name: "match",
-    type: 0,
-    parent: matchCategory.id
-  });
-
-  const team1VC = await guild.channels.create({
-    name: "Team 1 (Blue Side)",
-    type: 2,
-    parent: matchCategory.id
-  });
-
-  const team2VC = await guild.channels.create({
-    name: "Team 2 (Red Side)",
-    type: 2,
-    parent: matchCategory.id
-  });
+  const matchChannel = await guild.channels.create({ name: "match", type: 0, parent: matchCategory.id });
+  const team1VC = await guild.channels.create({ name: "Team 1 (Blue Side)", type: 2, parent: matchCategory.id });
+  const team2VC = await guild.channels.create({ name: "Team 2 (Red Side)", type: 2, parent: matchCategory.id });
 
   const embed = new EmbedBuilder()
     .setTitle("🎮 Match Ready!")
@@ -410,10 +744,53 @@ async function makeTeams(channel) {
     .setFooter({ text: "Use the team voice channels below to join your squad!" });
 
   await matchChannel.send({ embeds: [embed] });
+
+  // --- Build Multi OP.GG Links for each team ---
+  const buildMulti = (team) => {
+    const summoners = team
+      .map((id) => playerData[id]?.summonerName)
+      .filter(Boolean)
+      .map((url) => {
+        try {
+          const parts = url.split("/");
+          const namePart = decodeURIComponent(parts[parts.length - 1]);
+          return namePart.replace("-", "%23").replace(/\s+/g, "+");
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+    if (summoners.length === 0) return "https://www.op.gg/";
+    return `https://www.op.gg/lol/multisearch/na?summoners=${summoners.join("%2C")}`;
+  };
+
+  const team1Link = buildMulti(bestTeam1);
+  const team2Link = buildMulti(bestTeam2);
+
+  // --- Create Draft Lobby using draftlol.dawe.gg ---
+  try {
+    const { blue, red, spectator } = await createDraftLolLobby();
+    await matchChannel.send(
+      `🌐 **Match Links**\n + 🟦 **Blue Team OP.GG:** <${team1Link}>\n + 🟥 **Red Team OP.GG:** <${team2Link}>\n + 🎯 **Draft Lobby:**\n + Blue: <${blue}>\n + Red: <${red}>\n + Spectator: <${spectator}>`
+    );
+  } catch (err) {
+    console.error("Failed to create draft lobby:", err);
+    await matchChannel.send(
+      `🌐 **Match Links**\n🟦 **Blue Team OP.GG:** <${team1Link}>\n🟥 **Red Team OP.GG:** <${team2Link}>\n❌ Failed to create Draft Lobby. Players will need to pick manually.`
+    );
+  }
+
   matches.current = { team1: bestTeam1, team2: bestTeam2, matchChannel, team1VC, team2VC };
   queue = [];
   saveData();
   updateQueueMessage();
+
+  // Immediately apply mute logic to all players in voice channels
+  for (const member of channel.guild.members.cache.values()) {
+    const state = member.voice;
+    if (!state?.channelId) continue;
+    client.emit("voiceStateUpdate", { channelId: null, member }, state);
+  }
 }
 
 function formatPlayer(id) {
@@ -421,13 +798,12 @@ function formatPlayer(id) {
   if (p.division) return `<@${id}> - ${p.rank} ${p.division} ${p.lp} LP (${getIHP(p)})`;
   return `<@${id}> - ${p.rank} ${p.lp} LP (${getIHP(p)})`;
 }
-
 // ---------------- END MATCH ----------------
 async function endMatch(channel, winner) {
   if (!matches.current) return channel.send("No active match.");
+
   const { team1, team2, matchChannel, team1VC, team2VC } = matches.current;
   const guild = channel.guild;
-
   const general = guild.channels.cache.find(c => c.name === "general" && c.type === 0);
 
   let historyChannel = guild.channels.cache.find(c => c.name === "history" && c.type === 0);
@@ -438,39 +814,37 @@ async function endMatch(channel, winner) {
   const winners = winner === "1" ? team1 : team2;
   const losers = winner === "1" ? team2 : team1;
 
+  // Fun shoutout if Romeo wins
   if (winners.includes("272603932268822529")) {
     if (general) general.send("Wow Romeo actually won? That guy is ass");
   }
 
+  // Update winners
   winners.forEach((id) => {
     const p = ensurePlayer(id);
     const oldIHP = getIHP(p);
     const oldRank = p.rank;
     const oldDivision = p.division;
+
     p.wins++;
     p.lp += 20;
+
     checkRankChange(id, general, p, oldIHP, oldRank, oldDivision);
   });
 
+  // Update losers
   losers.forEach((id) => {
-  const p = ensurePlayer(id);
-  const oldIHP = getIHP(p);
-  const oldRank = p.rank;
-  const oldDivision = p.division;
+    const p = ensurePlayer(id);
+    const oldIHP = getIHP(p);
+    const oldRank = p.rank;
+    const oldDivision = p.division;
 
-  p.losses++;
-  p.lp -= 20; // subtract LP
-
-  // Clamp LP temporarily if you want to allow negative for demotion
-  if (p.lp < 0) {
-    // Demotion logic will handle negative LP correctly in IHPToRank
-  }
-
-  checkRankChange(id, general, p, oldIHP, oldRank, oldDivision);
-
-  // Ensure LP is at least 0 for display purposes
-  if (p.lp < 0) p.lp = 0;
-});
+    p.losses++;
+    p.lp -= 20;
+    // LP can go negative temporarily; demotion logic handles it
+    checkRankChange(id, general, p, oldIHP, oldRank, oldDivision);
+    if (p.lp < 0) p.lp = 0; // Display purposes
+  });
 
   saveData();
 
@@ -488,6 +862,7 @@ async function endMatch(channel, winner) {
 
   await historyChannel.send({ embeds: [embed] });
 
+  // Delete match channels
   try {
     if (matchChannel) await matchChannel.delete();
     if (team1VC) await team1VC.delete();
@@ -499,12 +874,14 @@ async function endMatch(channel, winner) {
   }
 
   matches.current = null;
+  resetMutedUsers(); // Reset mute tracking for next match
 }
 
 function checkRankChange(id, announceChannel, player, oldIHP, oldRank, oldDivision) {
   const newStats = IHPToRank(getIHP(player), oldRank, oldDivision);
   Object.assign(player, newStats);
   const newIHP = getIHP(player);
+
   if (player.rank !== oldRank || player.division !== oldDivision) {
     if (newIHP > oldIHP) {
       announceChannel.send(`🎉 <@${id}> ranked up to **${player.rank}${player.division ? " " + player.division : ""}**! 🏅`);
@@ -516,6 +893,7 @@ function checkRankChange(id, announceChannel, player, oldIHP, oldRank, oldDivisi
 
 // ---------------- READY ----------------
 const MAIN_GUILD_ID = "1421221145532956722";
+
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   const guild = client.guilds.cache.get(MAIN_GUILD_ID);
@@ -523,11 +901,15 @@ client.once("ready", async () => {
     console.log("Bot is not in the main server!");
     return;
   }
+
   let queueChannel = guild.channels.cache.find((c) => c.name === "queue");
   if (!queueChannel) {
     queueChannel = await guild.channels.create({ name: "queue", type: 0 });
   }
+
   await postQueueMessage(queueChannel);
+
+  // Call leaderboard properly
   await updateLeaderboardChannel(guild);
 });
 
