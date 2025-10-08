@@ -26,6 +26,9 @@ const client = new Client({
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
+// Add this near the top of your file
+const userRoleReplies = new Map(); // userId -> interaction reference
+
 // ---------------- CONFIG ----------------
 const DATA_FILE = "playerData.json";
 const QUEUE_SIZE = 10;
@@ -98,11 +101,12 @@ function ensurePlayer(id) {
 
 // ---------------- Role Selection -------------
 const ROLES = [
-  { label: "Top", value: "top" },
-  { label: "Jungle", value: "jungle" },
-  { label: "Mid", value: "mid" },
-  { label: "ADC", value: "adc" },
-  { label: "Support", value: "support" },
+  { label: "Fill", value: "Fill" },
+  { label: "Top", value: "Top" },
+  { label: "Jungle", value: "Jungle" },
+  { label: "Mid", value: "Mid" },
+  { label: "Bot", value: "Bot" },
+  { label: "Support", value: "Support" }
 ];
 
 async function sendRoleSelection(user) {
@@ -132,6 +136,18 @@ async function updateLeaderboardChannel(guild) {
   let lbChannel = guild.channels.cache.find(c => c.name === channelName && c.type === 0);
   if (!lbChannel) {
     lbChannel = await guild.channels.create({ name: channelName, type: 0 });
+  }
+
+  // Try to reuse old leaderboard messages
+  if (!leaderboardMessage || !leaderboardMessage.length) {
+    const fetched = await lbChannel.messages.fetch({ limit: 20 });
+    const existing = fetched.filter(m => m.author.id === client.user.id && m.embeds.length > 0);
+    if (existing.size > 0) {
+      leaderboardMessage = Array.from(existing.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+      console.log(`Found ${leaderboardMessage.length} existing leaderboard messages.`);
+    } else {
+      leaderboardMessage = [];
+    }
   }
 
   // Build leaderboard sorted by Elo/IHP
@@ -382,6 +398,41 @@ async function startReadyCheck(channel) {
   });
 }
 
+// Post role menus permanently in #how-to-play
+async function postRoleSelectionMessage(channel) {
+  // Check if the message already exists
+  const existing = (await channel.messages.fetch({ limit: 10 }))
+    .filter(
+      m =>
+        m.author.id === client.user.id &&
+        m.components.length > 0 &&
+        m.components[0].components[0]?.customId?.startsWith("role_select_global_")
+    )
+    .first();
+
+  if (existing) {
+    console.log("Role selection menus already exist — skipping repost.");
+    return; // Don’t post duplicates
+  }
+
+  // Otherwise, send new menus
+  const rows = [];
+  for (let i = 0; i < 5; i++) {
+    const selectMenu = new StringSelectMenuBuilder()
+      .setCustomId(`role_select_global_${i + 1}`)
+      .setPlaceholder(
+        `Select your ${i + 1}${i === 0 ? "st" : i === 1 ? "nd" : i === 2 ? "rd" : "th"} preferred role`
+      )
+      .addOptions(ROLES.map(r => ({ label: r.label, value: r.value })));
+    rows.push(new ActionRowBuilder().addComponents(selectMenu));
+  }
+
+  await channel.send({
+    content: "🎮 Select your **5 preferred roles** (1 = most preferred, 5 = least preferred):",
+    components: rows,
+  });
+}
+
 async function createDraftLolLobby() {
   const browser = await puppeteer.launch({ headless: true });
   const page = await browser.newPage();
@@ -487,10 +538,23 @@ function buildQueueEmbed() {
 
 // ---------------- QUEUE EMBED ----------------
 async function postQueueMessage(channel) {
+  // Check for an existing queue message (from the bot)
+  const existing = (await channel.messages.fetch({ limit: 10 }))
+    .filter(m => m.author.id === client.user.id && m.embeds.length && m.embeds[0].title === "🎮 Current Queue")
+    .first();
+
+  if (existing) {
+    console.log("Queue message already exists — reusing it.");
+    queueMessage = existing;
+    await updateQueueMessage();
+    return;
+  }
+
+  // Otherwise, create a new queue message
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("join").setLabel("✅ Join Queue").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("leave").setLabel("🚪 Leave Queue").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId("opgg").setLabel("🌐 Multi OP.GG").setStyle(ButtonStyle.Primary) // blue button
+    new ButtonBuilder().setCustomId("opgg").setLabel("🌐 Multi OP.GG").setStyle(ButtonStyle.Primary)
   );
 
   const embed = buildQueueEmbed();
@@ -536,23 +600,34 @@ client.on("interactionCreate", async (interaction) => {
   // ---------------- BUTTONS ----------------
   if (interaction.isButton()) {
     // --- Join Queue ---
-    if (interaction.customId === "join") {
-      const player = playerData[id];
-      if (!player || !player.summonerName) {
-        return interaction.reply({
-          content: "❌ You must **register** first with !register <OP.GG link> before joining the queue.",
-          ephemeral: true,
-        });
-      }
-      if (queue.includes(id)) {
-        return interaction.reply({ content: "⚠️ You're already in the queue.", ephemeral: true });
-      }
-      queue.push(id);
-      saveData();
-      await updateQueueMessage();
-      if (queue.length >= QUEUE_SIZE) await startReadyCheck(interaction.channel);
-      return interaction.deferUpdate();
-    }
+if (interaction.customId === "join") {
+  const player = playerData[id];
+
+  if (!player || !player.summonerName) {
+    return interaction.reply({
+      content: "❌ You must **register** first with !register <OP.GG link> before joining the queue.",
+      ephemeral: true,
+    });
+  }
+
+  // --- New: require 5 selected roles ---
+  if (!player.roles || player.roles.length < 5 || player.roles.some(r => !r)) {
+    return interaction.reply({
+      content: "❌ You must select **all 5 preferred roles** before joining the queue. Use the dropdowns in #how-to-play",
+      ephemeral: true,
+    });
+  }
+
+  if (queue.includes(id)) {
+    return interaction.reply({ content: "⚠️ You're already in the queue.", ephemeral: true });
+  }
+
+  queue.push(id);
+  saveData();
+  await updateQueueMessage();
+  if (queue.length >= QUEUE_SIZE) await startReadyCheck(interaction.channel);
+  return interaction.deferUpdate();
+}
 
     // --- Leave Queue ---
     if (interaction.customId === "leave") {
@@ -597,23 +672,51 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   // ---------------- SELECT MENUS ----------------
-  else if (interaction.isStringSelectMenu()) {
-    const userId = interaction.user.id;
-    ensurePlayer(userId);
+  else if (interaction.isStringSelectMenu() && interaction.customId.startsWith("role_select_global_")) {
+  const userId = interaction.user.id;
+  ensurePlayer(userId);
+  if (!playerData[userId].roles) playerData[userId].roles = Array(5).fill(null);
 
-    if (!playerData[userId].roles) playerData[userId].roles = [];
+  const slot = parseInt(interaction.customId.split("_").pop(), 10) - 1;
+  const selectedRole = interaction.values[0];
 
-    // parse the slot number from customId: role_select_<userId>_<1-5>
-    const parts = interaction.customId.split("_");
-    const slot = parseInt(parts[3]) - 1; // 0-4
-    playerData[userId].roles[slot] = interaction.values[0]; // store role
-    saveData();
-
-    await interaction.reply({
-      content: `✅ Saved your role choice for slot #${slot + 1}: ${interaction.values[0]}`,
-      ephemeral: true,
-    });
+  // --- Unique role enforcement ---
+  if (selectedRole !== "Fill") {
+    for (let i = 0; i < playerData[userId].roles.length; i++) {
+      if (i !== slot && playerData[userId].roles[i] === selectedRole) {
+        playerData[userId].roles[i] = null;
+      }
+    }
   }
+
+  // --- Save selected role ---
+  playerData[userId].roles[slot] = selectedRole;
+  saveData();
+
+  // Build display string of current preferences
+  const displayRoles = playerData[userId].roles
+    .map((r, i) => `${i + 1}: ${r || "❌ None"}`)
+    .join("\n");
+
+  const messageContent = `✅ Saved your #${slot + 1} preference as **${selectedRole}**.\n\nYour current preferences:\n${displayRoles}`;
+
+  try {
+    if (userRoleReplies.has(userId)) {
+      // Edit the existing ephemeral reply
+      const previousInteraction = userRoleReplies.get(userId);
+      await previousInteraction.editReply({ content: messageContent });
+      await interaction.deferUpdate(); // silently acknowledge interaction (no new message)
+    } else {
+      // First time: send the initial ephemeral reply
+      await interaction.reply({ content: messageContent, ephemeral: true });
+      userRoleReplies.set(userId, interaction);
+    }
+  } catch (err) {
+    // If something fails (e.g., expired interaction), just reply again
+    await interaction.reply({ content: messageContent, ephemeral: true });
+    userRoleReplies.set(userId, interaction);
+  }
+}
 });
 
 // ---------------- COMMANDS ----------------
@@ -845,30 +948,13 @@ client.on("messageCreate", async (message) => {
 
     await message.reply(`✅ Registered ${message.author.username} as **${tierText} ${lp} LP**`);
 
-    // ---------------- Role Selection Dropdowns ----------------
-    const rows = [];
-    for (let i = 0; i < 5; i++) {
-      const selectMenu = new StringSelectMenuBuilder()
-        .setCustomId(`role_select_${userId}_${i + 1}`) // unique per user
-        .setPlaceholder(`Select your ${i + 1}${i === 0 ? "st" : i === 1 ? "nd" : i === 2 ? "rd" : "th"} preferred role`)
-        .addOptions(
-          ROLES.map(r => ({ label: r.label, value: r.value }))
-        );
-      rows.push(new ActionRowBuilder().addComponents(selectMenu));
-    }
-
-    await message.channel.send({
-      content: `${message.author}, please select your **5 preferred roles** (1 = most preferred, 5 = least preferred):`,
-      components: rows
-    });
-
   } catch (err) {
     console.error(err);
     return message.reply("❌ Failed to fetch OP.GG page. Make sure the link is correct.");
   }
 });
 
-// ---------------- MATCHMAKING ----------------
+// ---------------- MATCHMAKING WITH ROLE ASSIGNMENT ----------------
 async function makeTeams(channel) {
   const players = [...queue];
   const IHPs = players.map((id) => getIHP(ensurePlayer(id)));
@@ -876,6 +962,7 @@ async function makeTeams(channel) {
   let bestTeam2 = null;
   let bestDiff = Infinity;
 
+  // --- Balance teams by closest Elo ---
   function combine(arr, k, start = 0, path = []) {
     if (path.length === k) {
       const team1 = path;
@@ -894,32 +981,50 @@ async function makeTeams(channel) {
       combine(arr, k, i + 1, [...path, i]);
     }
   }
-
   combine(players.map((_, i) => i), 5);
+
+  // --- Assign roles based on preferences ---
+  function assignRoles(team) {
+  const roleSlots = ["Top", "Jungle", "Mid", "Bot", "Support"];
+  const assigned = {};
+  const remainingRoles = new Set(roleSlots);
+
+  // Sort team by Elo descending
+  const sortedTeam = [...team].sort((a, b) => getIHP(ensurePlayer(b)) - getIHP(ensurePlayer(a)));
+
+  for (const playerId of sortedTeam) {
+    const prefs = (playerData[playerId].roles || [])
+      .filter(r => r !== "Fill" && remainingRoles.has(r));
+
+    if (prefs.length) {
+      assigned[playerId] = prefs[0]; // assign highest preferred available role
+      remainingRoles.delete(prefs[0]);
+    } else {
+      // If no preferred role available, assign any remaining role
+      const role = Array.from(remainingRoles)[0];
+      assigned[playerId] = role;
+      remainingRoles.delete(role);
+    }
+  }
+
+  return assigned;
+}
+
+  const team1Roles = assignRoles(bestTeam1);
+  const team2Roles = assignRoles(bestTeam2);
+
   const avg1 = Math.round(bestTeam1.reduce((a, id) => a + getIHP(ensurePlayer(id)), 0) / 5);
   const avg2 = Math.round(bestTeam2.reduce((a, id) => a + getIHP(ensurePlayer(id)), 0) / 5);
 
   // ---------------- CREATE MATCH CATEGORY + CHANNELS ----------------
   const guild = channel.guild;
-  let matchCategory = guild.channels.cache.find(
-    (c) => c.type === 4 && c.name.toLowerCase() === "match"
-  );
+  let matchCategory = guild.channels.cache.find((c) => c.type === 4 && c.name.toLowerCase() === "match");
   if (!matchCategory) {
     matchCategory = await guild.channels.create({ name: "Match", type: 4 });
   }
   const matchChannel = await guild.channels.create({ name: "match", type: 0, parent: matchCategory.id });
   const team1VC = await guild.channels.create({ name: "Team 1 (Blue Side)", type: 2, parent: matchCategory.id });
   const team2VC = await guild.channels.create({ name: "Team 2 (Red Side)", type: 2, parent: matchCategory.id });
-
-  const embed = new EmbedBuilder()
-    .setTitle("🎮 Match Ready!")
-    .addFields(
-      { name: `Team 1 (Avg Elo: ${avg1})`, value: bestTeam1.map((id) => formatPlayer(id)).join("\n"), inline: true },
-      { name: `Team 2 (Avg Elo: ${avg2})`, value: bestTeam2.map((id) => formatPlayer(id)).join("\n"), inline: true }
-    )
-    .setFooter({ text: "Use the team voice channels below to join your squad!" });
-
-  await matchChannel.send({ embeds: [embed] });
 
   // --- Build Multi OP.GG Links for each team ---
   const buildMulti = (team) => {
@@ -943,11 +1048,52 @@ async function makeTeams(channel) {
   const team1Link = buildMulti(bestTeam1);
   const team2Link = buildMulti(bestTeam2);
 
+  // --- Sort players by role for embed display with rank, LP, IHP, and emoji ---
+const roleEmojis = { Top: "<:TopLane:1425189239817240707>", Jungle: "<:Jungle:1425189561172234260>", Mid: "<:MidLane:1425189574799265893>", Bot: "<:ADC:1425189615060390062>", Support: "<:Support:1425189588523028552>" };
+const roleOrder = { Top: 1, Jungle: 2, Mid: 3, Bot: 4, Support: 5 };
+
+function formatTeamDisplay(team, roles) {
+  return team
+    .map((id) => {
+      const player = playerData[id];
+      const rank = player?.rank || "Unranked";
+      const lp = player?.lp ?? 0;
+      const ihp = getIHP(ensurePlayer(id)) ?? 0;
+      const role = roles[id];
+      return {
+        display: `<@${id}> / ${rank} ${lp} LP (${ihp}) / ${roleEmojis[role]} ${role}`,
+        role,
+      };
+    })
+    .sort((a, b) => roleOrder[a.role] - roleOrder[b.role])
+    .map((p) => p.display)
+    .join("\n");
+}
+
+  // --- Send match embed with assigned roles ---
+  const embed = new EmbedBuilder()
+    .setTitle("🎮 Match Ready!")
+    .addFields(
+      {
+        name: `Team 1 (Avg Elo: ${avg1})`,
+        value: formatTeamDisplay(bestTeam1, team1Roles),
+        inline: false, // stack vertically
+      },
+      {
+        name: `Team 2 (Avg Elo: ${avg2})`,
+        value: formatTeamDisplay(bestTeam2, team2Roles),
+        inline: false, // stack vertically
+      }
+    )
+    .setFooter({ text: "Use the team voice channels below to join your squad!" });
+
+  await matchChannel.send({ embeds: [embed] });
+
   // --- Create Draft Lobby using draftlol.dawe.gg ---
   try {
     const { blue, red, spectator } = await createDraftLolLobby();
     await matchChannel.send(
-      `🌐 **Match Links**\n + 🟦 **Blue Team OP.GG:** <${team1Link}>\n + 🟥 **Red Team OP.GG:** <${team2Link}>\n + 🎯 **Draft Lobby:**\n + Blue: <${blue}>\n + Red: <${red}>\n + Spectator: <${spectator}>`
+      `🌐 **Match Links**\n🟦 **Blue Team OP.GG:** <${team1Link}>\n🟥 **Red Team OP.GG:** <${team2Link}>\n🎯 **Draft Lobby:**\nBlue: <${blue}>\nRed: <${red}>\nSpectator: <${spectator}>`
     );
   } catch (err) {
     console.error("Failed to create draft lobby:", err);
@@ -956,7 +1102,15 @@ async function makeTeams(channel) {
     );
   }
 
-  matches.current = { team1: bestTeam1, team2: bestTeam2, matchChannel, team1VC, team2VC };
+  matches.current = {
+    team1: bestTeam1,
+    team2: bestTeam2,
+    matchChannel,
+    team1VC,
+    team2VC,
+    team1Roles,
+    team2Roles,
+  };
   queue = [];
   saveData();
   updateQueueMessage();
@@ -1083,6 +1237,13 @@ client.once("ready", async () => {
     console.log("Bot is not in the main server!");
     return;
   }
+  const howtoplayChannel = guild.channels.cache.find(c => c.name === "how-to-play");
+  if (!howtoplayChannel) {
+    howtoplayChannel = await guild.channels.create({ name: "how-to-play", type: 0 });
+  }
+
+  // Only post once to avoid duplicates (optional: check if message already exists)
+  await postRoleSelectionMessage(howtoplayChannel);
 
   let queueChannel = guild.channels.cache.find((c) => c.name === "queue");
   if (!queueChannel) {
